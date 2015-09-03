@@ -24,3 +24,5 @@ _testmain.go
 *.prof
 
 gloster
+gloster-cli
+*.db
