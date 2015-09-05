@@ -11,6 +11,7 @@ import (
 type Config struct {
     Addr    n.Node
     Cluster map[string]n.Node
+    ElectionTimeout int // ms
 }
 
 func NewConfig(addr, cluster string) *Config {
@@ -24,6 +25,7 @@ func NewConfig(addr, cluster string) *Config {
     return &Config{
         Addr:    addrNode,
         Cluster: parseList(cluster),
+        ElectionTimeout: 1000,
     }
 }
 
