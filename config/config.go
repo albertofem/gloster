@@ -12,10 +12,11 @@ type Config struct {
     Addr    n.Node
     Cluster map[string]n.Node
     ElectionTimeout int // ms
+    DatabasePath string
 }
 
-func NewConfig(addr, cluster string) *Config {
-    addrNode, err := parse(addr)
+func NewConfig(addr, cluster string, database string) *Config {
+    addrNode, err := ParseNodeConfig(addr)
     if err != nil {
         log.Println("Error parsing Local Address ", addr)
 
@@ -24,18 +25,19 @@ func NewConfig(addr, cluster string) *Config {
 
     return &Config{
         Addr:    addrNode,
-        Cluster: parseList(cluster),
+        Cluster: ParseClusterConfig(cluster),
         ElectionTimeout: 1000,
+        DatabasePath: database,
     }
 }
 
-func parseList(clusterList string) map[string]n.Node {
+func ParseClusterConfig(clusterList string) map[string]n.Node {
     parts := strings.Split(clusterList, ",")
     r := make(map[string]n.Node, len(parts))
 
     if len(parts) > 0 && len(parts[0]) > 0 {
         for _, nodePart := range parts {
-            node, err := parse(nodePart)
+            node, err := ParseNodeConfig(nodePart)
 
             if err != nil {
                 continue
@@ -50,7 +52,7 @@ func parseList(clusterList string) map[string]n.Node {
     return nil
 }
 
-func parse(node string) (n.Node, error) {
+func ParseNodeConfig(node string) (n.Node, error) {
     nodeParts := clear(node)
 
     if len(nodeParts) != 0 {

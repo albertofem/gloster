@@ -3,16 +3,14 @@ package server
 import (
     "log"
     "net"
-
     "github.com/albertofem/gloster/config"
     n "github.com/albertofem/gloster/node"
-    "github.com/mgutz/str"
     "github.com/boltdb/bolt"
     "fmt"
-    "bufio"
-    "strings"
     "github.com/albertofem/gloster/database"
     "time"
+    "net/rpc"
+    "github.com/albertofem/gloster/raft_rpc"
 )
 
 const (
@@ -28,12 +26,14 @@ type Server struct {
     database    *bolt.DB
     exit        chan bool
     connections chan net.Conn
-    state       ServerState
+    State       ServerState
     electionTimeoutChan chan bool
+    rpcServer   *rpc.Server
+    votesReceived int
 }
 
 type ServerState struct {
-    currentState string // follower, candidate, leader
+    CurrentState string // follower, candidate, leader
     currentTerm int
     votedFor *n.Node
     commandLog []database.Command
@@ -47,7 +47,7 @@ type ServerState struct {
 
 func New(c *config.Config) *Server {
     serverState := ServerState{
-        currentState: Follower,
+        CurrentState: Follower,
         currentTerm: 0,
         votedFor: nil,
         commandLog: nil, // initialize this
@@ -61,7 +61,7 @@ func New(c *config.Config) *Server {
         config: c,
         exit: make(chan bool),
         node: c.Addr,
-        state: serverState,
+        State: serverState,
         electionTimeoutChan: make(chan bool),
     }
 }
@@ -69,32 +69,38 @@ func New(c *config.Config) *Server {
 func (s *Server) Init() {
     defer close(s.exit)
 
-    s.initializeDb();
     s.serve()
     s.run()
 }
 
 func (s *Server) Shutdown() {
-    fmt.Println("Shuting down...")
+    s.logState("Shuting down...")
     s.exit <- true
 }
 
 func (s *Server) serve() {
-    server, err := net.Listen("tcp", string(s.config.Addr.String()))
+    s.logState("Serving TCP on: " + s.node.String())
+
+    glosterServer := new(Server)
+
+    s.rpcServer = rpc.NewServer()
+    s.rpcServer.Register(glosterServer)
+
+    listener, err := net.Listen("tcp", string(s.config.Addr.String()))
 
     if err != nil {
-        log.Println("Error starting Socket Server: ", err)
+        s.logState("Error starting Socket Server: " + err.Error())
         return
     }
 
-    s.openConnections(server)
+    s.openConnections(listener)
 }
 
 func (s *Server) run() { // main server loop
 
-    s.state.currentState = Follower
+    s.State.CurrentState = Follower
 
-    currentState := s.state.currentState
+    currentState := s.State.CurrentState
 
     for currentState != Stopped {
         switch currentState {
@@ -106,7 +112,7 @@ func (s *Server) run() { // main server loop
                 s.lead()
         }
 
-        currentState = s.state.currentState
+        currentState = s.State.CurrentState
     }
 }
 
@@ -115,79 +121,135 @@ func (s *Server) follow() {
     s.logState("Following...")
     s.resetElectionTimeout()
 
-    for s.state.currentState == Follower {
+    for s.State.CurrentState == Follower {
         select {
         case <-s.exit:
-            s.state.currentState = Stopped
+            s.State.CurrentState = Stopped
             return
 
-        case client := <-s.connections:
-            go s.accept(client)
+        case connection := <-s.connections:
+            s.accept(connection)
 
         case <-s.electionTimeoutChan:
-            s.state.currentState = Candidate
+            if (s.State.votedFor == nil) { // no voted casted, go for candidacy
+                s.State.CurrentState = Candidate
+            }
         }
     }
-
-    // handle request vote (vote for peer)
-
-    // if timeout -> go to candidate
 }
 
 func (s *Server) candidate() {
     s.logState("Candidating...")
 
-    s.state.currentTerm = 1
+    s.State.currentTerm = 1
+    s.State.votedFor = &s.node
     s.resetElectionTimeout()
 
-    for s.state.currentState == Candidate {
+    // send request vote to all peers
+    s.sendRequestVote()
+
+    for s.State.CurrentState == Candidate {
         select {
         case <-s.exit:
-            s.state.currentState = Stopped
+            s.State.CurrentState = Stopped
             return
 
-        case client := <-s.connections:
-            go s.accept(client)
+        case connection := <-s.connections:
+            s.accept(connection)
 
         case <-s.electionTimeoutChan:
-            s.state.currentState = Follower
+            if (s.votesReceived+1 >= len(s.config.Cluster)) {
+                s.State.CurrentState = Leader
+            } else { // reset election
+                s.votesReceived = 0
+                s.State.CurrentState = Candidate
+            }
         }
     }
+}
 
-    // increment current term
+func (s *Server) sendRequestVote() {
+    for _, node := range s.config.Cluster {
+        client, err := rpc.Dial("tcp", node.String())
+        if err != nil {
+            s.logState("Cannot connect to peer: " + node.String())
+            continue
+        }
 
-    // vote for self
+        requestVote := raft_rpc.RequestVote{
+            Term: s.State.currentTerm,
+            CandidateId: s.node.String(),
+            LastLogIndex: s.State.lastApplied,
+            LastLogTerm: s.State.currentTerm,
+        }
 
-    // reset election timeout
+        var requestVoteResult raft_rpc.RequestVoteResult
 
-    // send request vote to all peers
+        err = client.Call("Server.RequestVote", requestVote, &requestVoteResult)
 
-    // if requestvote -> ignore
+        if err != nil {
+            s.logState("Fatal error request vote to '" + node.String() + "': " + err.Error())
+            continue
+        }
 
-    // if appendentries -> to follower
-
-    // if timeout -> new election
+        if (requestVoteResult.VoteGranted == true) {
+            s.votesReceived++
+        }
+    }
 }
 
 func (s *Server) resetElectionTimeout() {
-    s.logState("Election timeout reset")
-
     go func() {
         time.Sleep(time.Duration(s.config.ElectionTimeout) * time.Millisecond)
         s.electionTimeoutChan <- true
     }()
 }
 
-func (s *Server) lead() {
-    // send empty append entries to all nodes (confirm as leader)
+func (s *Server) RequestVote(v raft_rpc.RequestVote, voteResult *raft_rpc.RequestVoteResult) error {
+    s.logState("Ready to cast vote")
 
-    // append entries heartbeat (define timeout)
+    // already voted, ignore
+    if s.State.votedFor != nil {
+        s.logState("Already voted, ignoring")
+        return nil
+    }
 
-    //
+    // node is outdated, ignore
+    if v.LastLogIndex < s.State.lastApplied {
+        s.logState("Node to vote for is outdated, ignoring")
+        return nil
+    }
+
+    node, err := config.ParseNodeConfig(v.CandidateId)
+
+    if err != nil {
+        s.logState("Invalid candidate for voting: " + err.Error())
+        return nil
+    }
+
+    s.State.votedFor = &node
+
+    voteResult.VoteGranted = true
+    voteResult.Term = s.State.currentTerm
+
+    s.logState("Voted for node: " + v.CandidateId)
+
+    return nil
 }
 
-func (s *Server) State() string {
-    return s.state.currentState
+func (s *Server) lead() {
+    s.logState("Leading...")
+
+    for s.State.CurrentState == Leader {
+        select {
+        case <-s.exit:
+            s.State.CurrentState = Stopped
+            return
+
+        case connection := <-s.connections:
+            s.accept(connection)
+        }
+    }
 }
 
 func (s *Server) openConnections(listener net.Listener) {
@@ -195,44 +257,22 @@ func (s *Server) openConnections(listener net.Listener) {
 
     go func() {
         for {
-            client, err := listener.Accept()
+            connection, err := listener.Accept()
 
-            if client == nil {
+            if connection == nil {
                 log.Fatal(err)
                 continue
             }
 
-            fmt.Println("Accepted connection from " + client.RemoteAddr().String())
+            s.logState("Accepted connection from " + connection.RemoteAddr().String())
 
-            s.connections<-client
+            s.connections<-connection
         }
     }()
 }
 
-func (s *Server) accept(client net.Conn) {
-    b := bufio.NewReader(client)
-
-    for {
-        line, err := b.ReadString('\n')
-
-        if err != nil {
-            break
-        }
-
-        command := str.ToArgv(strings.Trim(line, "\n"))
-        response := ""
-
-        switch command[0] {
-            case "SET", "set":
-                response = s.handleSet(command[1], command[2])
-            case "GET", "get":
-                response = s.handleGet(command[1])
-            default:
-                response = "Unrecognized command"
-        }
-
-        client.Write([]byte(response + "\n"))
-    }
+func (s *Server) accept(connection net.Conn) {
+    go s.rpcServer.ServeConn(connection)
 }
 
 func (s *Server) handleSet(key string, value string) string {
@@ -274,7 +314,7 @@ func (s *Server) handleGet(key string) string {
 }
 
 func (s *Server) initializeDb() {
-    db, err := bolt.Open("my.db", 0600, nil)
+    db, err := bolt.Open(s.config.DatabasePath, 0600, nil)
 
     if err != nil {
         log.Fatal(err)
@@ -284,5 +324,5 @@ func (s *Server) initializeDb() {
 }
 
 func (s *Server) logState(state string) {
-    fmt.Println("> - " + s.State() + " - " + state)
+    fmt.Println("> (" + s.State.CurrentState + ") " + state)
 }

@@ -11,19 +11,26 @@ import (
 
     "github.com/albertofem/gloster/config"
     "github.com/albertofem/gloster/server"
+    "gopkg.in/alecthomas/kingpin.v1"
 )
+
+var (
+    addr = kingpin.Arg("addr", "Node address <ip>:<port>").Required().String()
+    cluster = kingpin.Arg("cluster", "Rest of cluster nodes, comma separated").Required().String()
+    database = kingpin.Arg("database", "Path to database file").Required().String()
+)
+
 
 func main() {
     runtime.GOMAXPROCS(runtime.NumCPU())
 
-    addr := flag.String("addr", "127.0.0.1:12000", "Port where Gloster will listen on")
-    cluster := flag.String("cluster", "127.0.0.1:12000,127.0.0.1:12001,127.0.0.1:12002", "Cluster list, comma separated")
+    kingpin.Parse();
 
     flag.Parse()
 
     log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
 
-    config := config.NewConfig(*addr, *cluster)
+    config := config.NewConfig(*addr, *cluster, *database)
 
     fmt.Printf("Welcome to Gloster!, Listening on %d\n", config.Addr.Port)
     fmt.Printf("Using %d nodes\n", len(config.Cluster))
