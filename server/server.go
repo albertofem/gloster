@@ -11,6 +11,7 @@ import (
     "time"
     "net/rpc"
     "github.com/albertofem/gloster/raft_rpc"
+    "math/rand"
 )
 
 const (
@@ -47,7 +48,7 @@ type ServerState struct {
 
 func New(c *config.Config) *Server {
     serverState := ServerState{
-        CurrentState: Follower,
+        CurrentState: Stopped,
         currentTerm: 0,
         votedFor: nil,
         commandLog: nil, // initialize this
@@ -145,8 +146,10 @@ func (s *Server) candidate() {
     s.State.votedFor = &s.node
     s.resetElectionTimeout()
 
+    requestVoteResultChan := make(chan *rpc.Call, 10)
+
     // send request vote to all peers
-    s.sendRequestVote()
+    s.sendRequestVote(requestVoteResultChan)
 
     for s.State.CurrentState == Candidate {
         select {
@@ -162,15 +165,19 @@ func (s *Server) candidate() {
                 s.State.CurrentState = Leader
             } else { // reset election
                 s.votesReceived = 0
-                s.State.CurrentState = Candidate
+                return
             }
+
+        case requestResult := <-requestVoteResultChan:
+            s.handleSendRequestVoteResult(requestResult)
         }
     }
 }
 
-func (s *Server) sendRequestVote() {
+func (s *Server) sendRequestVote(requestVoteResultChan chan *rpc.Call) {
     for _, node := range s.config.Cluster {
         client, err := rpc.Dial("tcp", node.String())
+
         if err != nil {
             s.logState("Cannot connect to peer: " + node.String())
             continue
@@ -185,27 +192,33 @@ func (s *Server) sendRequestVote() {
 
         var requestVoteResult raft_rpc.RequestVoteResult
 
-        err = client.Call("Server.RequestVote", requestVote, &requestVoteResult)
+        client.Go("Server.RequestVote", requestVote, &requestVoteResult, requestVoteResultChan)
+    }
+}
 
-        if err != nil {
-            s.logState("Fatal error request vote to '" + node.String() + "': " + err.Error())
-            continue
-        }
+func (s *Server) handleSendRequestVoteResult(c *rpc.Call) {
+    var requestVoteResult *raft_rpc.RequestVoteResult
 
-        if (requestVoteResult.VoteGranted == true) {
-            s.votesReceived++
-        }
+    requestVoteResult = c.Reply.(*raft_rpc.RequestVoteResult)
+
+    if (requestVoteResult.VoteGranted == true) {
+        s.logState("Voted for me! +1")
+        s.votesReceived++
     }
 }
 
 func (s *Server) resetElectionTimeout() {
     go func() {
-        time.Sleep(time.Duration(s.config.ElectionTimeout) * time.Millisecond)
+        rand.Seed(time.Now().Unix())
+        randomTimeout := rand.Intn(s.config.ElectionTimeout + 1 - s.config.ElectionTimeout) + s.config.ElectionTimeout
+
+        time.Sleep(time.Duration(randomTimeout) * time.Millisecond)
         s.electionTimeoutChan <- true
     }()
 }
 
 func (s *Server) RequestVote(v raft_rpc.RequestVote, voteResult *raft_rpc.RequestVoteResult) error {
+    fmt.Printf("Server: %s", s)
     s.logState("Ready to cast vote")
 
     // already voted, ignore
