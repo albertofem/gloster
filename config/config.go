@@ -2,15 +2,16 @@ package config
 
 import (
     "fmt"
-    n "github.com/albertofem/gloster/node"
     "log"
     "strconv"
     "strings"
+
+    "github.com/albertofem/gloster/node"
 )
 
 type Config struct {
-    Addr    n.Node
-    Cluster map[string]n.Node
+    Addr    node.Node
+    Cluster map[string]node.Node
     ElectionTimeout int // ms
     DatabasePath string
 }
@@ -33,7 +34,7 @@ func NewConfig(addr, cluster string, database string) *Config {
 
 func ParseClusterConfig(clusterList string) map[string]n.Node {
     parts := strings.Split(clusterList, ",")
-    r := make(map[string]n.Node, len(parts))
+    r := make(map[string]node.Node, len(parts))
 
     if len(parts) > 0 && len(parts[0]) > 0 {
         for _, nodePart := range parts {
@@ -52,7 +53,7 @@ func ParseClusterConfig(clusterList string) map[string]n.Node {
     return nil
 }
 
-func ParseNodeConfig(node string) (n.Node, error) {
+func ParseNodeConfig(node string) (node.Node, error) {
     nodeParts := clear(node)
 
     if len(nodeParts) != 0 {
@@ -62,16 +63,16 @@ func ParseNodeConfig(node string) (n.Node, error) {
     p := strings.Split(node, ":")
 
     if len(p) != 2 {
-        return n.Node{}, fmt.Errorf("Error building Node on config: %s", p)
+        return node.Node{}, fmt.Errorf("Error building Node on config: %s", p)
     }
 
     port, err := strconv.ParseInt(p[1], 10, 64)
 
     if err != nil {
-        return n.Node{}, err
+        return node.Node{}, err
     }
 
-    return n.Node{Host: p[0], Port: int(port)}, nil
+    return node.Node{Host: p[0], Port: int(port)}, nil
 }
 
 func clear(node string) []string {
